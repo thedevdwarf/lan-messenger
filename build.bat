@@ -1,22 +1,30 @@
 @echo off
 title LAN Messenger - Build
 
-echo [1/3] PyInstaller kuruluyor...
+echo [1/4] Bagimliliklar kuruluyor...
 pip install pyinstaller pillow pystray --quiet
 
-echo [2/3] Uygulama derleniyor...
+echo [2/4] Ikon olusturuluyor...
+python create_icon.py
+
+echo [3/4] Uygulama derleniyor...
 pyinstaller ^
   --name "LAN Messenger" ^
   --windowed ^
   --onedir ^
   --clean ^
   --noconfirm ^
+  --icon=icon.ico ^
   lan_messenger.py
 
-echo [3/3] Installer kontrol ediliyor...
+echo icon.ico dist klasorune kopyalaniyor...
+copy /Y icon.ico "dist\LAN Messenger\icon.ico"
+
+echo [4/4] Installer kontrol ediliyor...
 set INNO="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if exist %INNO% (
     echo Inno Setup bulundu, installer olusturuluyor...
+    mkdir installer_output 2>nul
     %INNO% installer.iss
     echo.
     echo === TAMAMLANDI ===
@@ -24,7 +32,7 @@ if exist %INNO% (
 ) else (
     echo.
     echo === TAMAMLANDI ===
-    echo Calistirilebilir dosya: dist\LAN Messenger\LAN Messenger.exe
+    echo Calistirilebilir: dist\LAN Messenger\LAN Messenger.exe
     echo.
     echo Installer icin Inno Setup kurun:
     echo https://jrsoftware.org/isdl.php
