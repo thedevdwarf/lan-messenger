@@ -104,6 +104,21 @@ class NetworkService:
             "status": self.get_status(),
         })
 
+    def send_hello_to(self, ip):
+        """Belirli bir IP'ye doğrudan unicast hello gönder."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            data = json.dumps({
+                "type": "hello",
+                "username": self.username,
+                "ip": self.local_ip,
+                "status": self.get_status(),
+            }).encode()
+            s.sendto(data, (ip, DISCOVERY_PORT))
+            s.close()
+        except Exception:
+            pass
+
     # UDP -----------------------------------------------------------------
 
     def _udp_broadcast(self, data):
@@ -693,11 +708,45 @@ class LANMessengerApp:
         self._listbox.pack(fill="both", expand=True, padx=2, pady=2)
         self._listbox.bind("<Double-Button-1>", self._open_from_list)
 
+        # Manuel IP bağlantısı
+        manual_frame = tk.Frame(self.root, bg="#002255")
+        manual_frame.pack(fill="x", side="bottom", padx=0, pady=0)
+        tk.Label(manual_frame, text="IP:", bg="#002255", fg="#AABBFF",
+                 font=("Tahoma", 8)).pack(side="left", padx=(8, 2), pady=4)
+        self._ip_entry = tk.Entry(manual_frame, font=("Tahoma", 9), width=14,
+                                   bg="#003377", fg="white", insertbackground="white",
+                                   relief="flat", bd=1)
+        self._ip_entry.pack(side="left", pady=4)
+        self._ip_entry.bind("<Return>", lambda e: self._manual_connect())
+        tk.Button(manual_frame, text="Bağlan", command=self._manual_connect,
+                  bg="#0055CC", fg="white", font=("Tahoma", 8),
+                  relief="flat", padx=8, cursor="hand2").pack(side="left", padx=4, pady=3)
+
         self._status_lbl = tk.Label(
             self.root, text="Ağ taranıyor...", bg="#002277",
             fg="#AABBFF", font=("Tahoma", 8), anchor="w"
         )
         self._status_lbl.pack(fill="x", side="bottom")
+
+    # -- manuel IP bağlantısı ------------------------------------------------
+
+    def _manual_connect(self):
+        ip = self._ip_entry.get().strip()
+        if not ip:
+            return
+        # Basit IP doğrulama
+        parts = ip.split(".")
+        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            messagebox.showwarning("Hata", "Geçerli bir IP girin.\nÖrnek: 192.168.1.110", parent=self.root)
+            return
+        # 3 kez hello gönder (paket kaybına karşı)
+        def _send():
+            for _ in range(3):
+                self.network.send_hello_to(ip)
+                time.sleep(0.5)
+        threading.Thread(target=_send, daemon=True).start()
+        self._ip_entry.delete(0, "end")
+        self._status_lbl.config(text=f"{ip} adresine bağlanıyor...")
 
     # -- X butonu davranışı --------------------------------------------------
 
