@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-LAN Messenger v2
+LAN Messenger v3
 Kurulum: pip install pystray pillow
 Her bilgisayarda aynı dosyayı çalıştır. Sunucu gerekmez.
-Geçmiş: %USERPROFILE%\.lan_messenger\<kullanici>.db
+Geçmiş : %USERPROFILE%\.lan_messenger\<kullanici>.db
 Dosyalar: %USERPROFILE%\Downloads\LAN_Messenger\
 """
 
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import socket, threading, json, sqlite3, datetime
-import os, struct, time, mimetypes
+import os, struct, time, mimetypes, sys, winreg
 
 try:
     import pystray
@@ -22,9 +22,54 @@ except ImportError:
 DISCOVERY_PORT = 55100
 MESSAGE_PORT   = 55101
 BROADCAST_INT  = 5
-MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_FILE_BYTES = 100 * 1024 * 1024
 SAVE_DIR       = os.path.join(os.path.expanduser("~"), "Downloads", "LAN_Messenger")
 IMAGE_EXTS     = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
+
+STATUS_ONLINE = "online"
+STATUS_BUSY   = "busy"
+STATUS_AWAY   = "away"
+
+STATUS_DOT   = {STATUS_ONLINE: "🟢", STATUS_BUSY: "🟡", STATUS_AWAY: "🟠"}
+STATUS_LABEL = {STATUS_ONLINE: "Çevrimiçi", STATUS_BUSY: "Meşgul", STATUS_AWAY: "Uzakta"}
+STATUS_COLOR = {STATUS_ONLINE: "#003399",   STATUS_BUSY: "#CC6600",  STATUS_AWAY: "#666666"}
+
+
+# ---------------------------------------------------------------------------
+# Windows başlangıç kaydı
+# ---------------------------------------------------------------------------
+
+def _startup_value():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+    script  = os.path.abspath(__file__)
+    return f'"{pythonw}" "{script}"'
+
+def add_to_startup():
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_READ | winreg.KEY_WRITE
+        )
+        winreg.SetValueEx(key, "LAN Messenger", 0, winreg.REG_SZ, _startup_value())
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+def is_in_startup():
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_READ
+        )
+        winreg.QueryValueEx(key, "LAN Messenger")
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -32,12 +77,13 @@ IMAGE_EXTS     = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"}
 # ---------------------------------------------------------------------------
 
 class NetworkService:
-    def __init__(self, username, local_ip, on_peer_found, on_peer_lost, on_message):
+    def __init__(self, username, local_ip, on_peer_found, on_peer_lost, on_message, get_status):
         self.username      = username
         self.local_ip      = local_ip
         self.on_peer_found = on_peer_found
         self.on_peer_lost  = on_peer_lost
         self.on_message    = on_message
+        self.get_status    = get_status   # callable → kendi anlık durumu döner
         self.running       = False
 
     def start(self):
@@ -49,7 +95,16 @@ class NetworkService:
         self.running = False
         self._udp_broadcast({"type": "bye", "username": self.username, "ip": self.local_ip})
 
-    # UDP ---------------------------------------------------------------
+    def broadcast_status(self):
+        """Durum değişince anında broadcast gönder."""
+        self._udp_broadcast({
+            "type": "hello",
+            "username": self.username,
+            "ip": self.local_ip,
+            "status": self.get_status(),
+        })
+
+    # UDP -----------------------------------------------------------------
 
     def _udp_broadcast(self, data):
         try:
@@ -61,9 +116,13 @@ class NetworkService:
             pass
 
     def _broadcaster(self):
-        payload = {"type": "hello", "username": self.username, "ip": self.local_ip}
         while self.running:
-            self._udp_broadcast(payload)
+            self._udp_broadcast({
+                "type": "hello",
+                "username": self.username,
+                "ip": self.local_ip,
+                "status": self.get_status(),
+            })
             time.sleep(BROADCAST_INT)
 
     def _discovery_listener(self):
@@ -77,13 +136,14 @@ class NetworkService:
         while self.running:
             try:
                 data, addr = s.recvfrom(1024)
-                msg  = json.loads(data.decode())
-                ip   = msg.get("ip", addr[0])
-                name = msg.get("username", ip)
+                msg    = json.loads(data.decode())
+                ip     = msg.get("ip", addr[0])
+                name   = msg.get("username", ip)
+                status = msg.get("status", STATUS_ONLINE)
                 if ip == self.local_ip:
                     continue
                 if msg["type"] == "hello":
-                    self.on_peer_found(ip, name)
+                    self.on_peer_found(ip, name, status)
                 elif msg["type"] == "bye":
                     self.on_peer_lost(ip)
             except socket.timeout:
@@ -92,7 +152,7 @@ class NetworkService:
                 pass
         s.close()
 
-    # TCP ---------------------------------------------------------------
+    # TCP -----------------------------------------------------------------
 
     def _message_server(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -161,12 +221,8 @@ class NetworkService:
             return False, "Dosya 100 MB üzerinde."
         filename = os.path.basename(filepath)
         mime, _  = mimetypes.guess_type(filepath)
-        header   = {
-            "type": "file",
-            "filename": filename,
-            "file_size": size,
-            "mime": mime or "application/octet-stream",
-        }
+        header   = {"type": "file", "filename": filename,
+                    "file_size": size, "mime": mime or "application/octet-stream"}
         with open(filepath, "rb") as f:
             data = f.read()
         return self._tcp_send(ip, header, data), None
@@ -244,7 +300,7 @@ class ChatWindow:
         self.peer_name = peer_name
         self.db        = db
         self.network   = network
-        self._images   = []  # PIL referanslarını canlı tut
+        self._images   = []
 
         self.win = tk.Toplevel(parent)
         self.win.title(f"Sohbet — {peer_name}")
@@ -253,8 +309,6 @@ class ChatWindow:
         self.win.protocol("WM_DELETE_WINDOW", lambda: on_close(peer_ip))
         self._build()
         self._load_history()
-
-    # -- GUI ------------------------------------------------------------------
 
     def _build(self):
         bar = tk.Frame(self.win, bg="#003399", height=46)
@@ -267,10 +321,8 @@ class ChatWindow:
 
         chat_frame = tk.Frame(self.win)
         chat_frame.pack(fill="both", expand=True, padx=6, pady=6)
-
         sb = tk.Scrollbar(chat_frame, orient="vertical")
         sb.pack(side="right", fill="y")
-
         self.chat = tk.Text(
             chat_frame, wrap="word", bg="#FFFFFF", fg="#000033",
             font=("Tahoma", 10), state="disabled", relief="flat",
@@ -279,22 +331,16 @@ class ChatWindow:
         )
         self.chat.pack(side="left", fill="both", expand=True)
         sb.config(command=self.chat.yview)
-
         self.chat.tag_config("my_name",   foreground="#CC0000", font=("Tahoma", 10, "bold"))
         self.chat.tag_config("my_msg",    foreground="#000033", font=("Tahoma", 10))
         self.chat.tag_config("peer_name", foreground="#0044CC", font=("Tahoma", 10, "bold"))
         self.chat.tag_config("peer_msg",  foreground="#000033", font=("Tahoma", 10))
 
-        # Giriş alanı
         bottom = tk.Frame(self.win, bg="#DDE8FF")
         bottom.pack(fill="x", padx=6, pady=(0, 6))
-
-        tk.Button(
-            bottom, text="📎", command=self._pick_file,
-            bg="#DDE8FF", fg="#003399", font=("Arial", 15),
-            relief="flat", cursor="hand2", bd=0, padx=4
-        ).pack(side="left")
-
+        tk.Button(bottom, text="📎", command=self._pick_file,
+                  bg="#DDE8FF", fg="#003399", font=("Arial", 15),
+                  relief="flat", cursor="hand2", bd=0, padx=4).pack(side="left")
         self.input_box = tk.Text(
             bottom, height=3, font=("Tahoma", 10), relief="flat",
             bd=1, bg="white", wrap="word",
@@ -303,21 +349,16 @@ class ChatWindow:
         self.input_box.pack(side="left", fill="x", expand=True, padx=(3, 5))
         self.input_box.bind("<Return>", self._on_enter)
         self.input_box.focus()
-
-        tk.Button(
-            bottom, text="Gönder", command=self._send_text,
-            bg="#003399", fg="white", font=("Tahoma", 10),
-            relief="flat", padx=14, cursor="hand2",
-            activebackground="#0044CC"
-        ).pack(side="right", fill="y")
+        tk.Button(bottom, text="Gönder", command=self._send_text,
+                  bg="#003399", fg="white", font=("Tahoma", 10),
+                  relief="flat", padx=14, cursor="hand2",
+                  activebackground="#0044CC").pack(side="right", fill="y")
 
     def _on_enter(self, e):
         if e.state & 0x1:
             return
         self._send_text()
         return "break"
-
-    # -- geçmiş ---------------------------------------------------------------
 
     def _load_history(self):
         for row in self.db.load(self.peer_ip):
@@ -328,8 +369,6 @@ class ChatWindow:
                 self._append_text(actual_name, content or "", ts, is_me)
             else:
                 self._append_file(actual_name, filename or "", saved_path, ts, is_me)
-
-    # -- render ---------------------------------------------------------------
 
     def _ts_str(self, ts):
         try:
@@ -350,10 +389,7 @@ class ChatWindow:
         self.chat.configure(state="normal")
         nt = "my_name" if is_me else "peer_name"
         self.chat.insert("end", f"{name} ({self._ts_str(ts)}):\n", nt)
-
         ext = os.path.splitext(filename)[1].lower()
-
-        # Resim ön izlemesi
         if HAS_EXTRAS and ext in IMAGE_EXTS and saved_path and os.path.exists(saved_path):
             try:
                 img = PILImage.open(saved_path)
@@ -366,19 +402,17 @@ class ChatWindow:
                 self.chat.insert("end", "\n")
             except Exception:
                 pass
-
-        # Dosya kartı
         card = tk.Frame(self.chat, bg="#E8F0FF", bd=1, relief="solid")
-        icon = "🖼️" if ext in IMAGE_EXTS else ("🎵" if ext in {".mp3",".wav",".ogg"} else
-                                                 "🎬" if ext in {".mp4",".mkv",".avi"} else "📄")
+        icon = ("🖼️" if ext in IMAGE_EXTS else
+                "🎵" if ext in {".mp3", ".wav", ".ogg"} else
+                "🎬" if ext in {".mp4", ".mkv", ".avi"} else "📄")
         tk.Label(card, text=f"  {icon}  {filename}", bg="#E8F0FF",
-                 fg="#000033", font=("Tahoma", 9), anchor="w").pack(side="left",
-                                                                     padx=6, pady=5, fill="x", expand=True)
+                 fg="#000033", font=("Tahoma", 9), anchor="w"
+                 ).pack(side="left", padx=6, pady=5, fill="x", expand=True)
         if saved_path and os.path.exists(saved_path):
             tk.Button(card, text="Aç", command=lambda p=saved_path: self._open_file(p),
                       bg="#003399", fg="white", font=("Tahoma", 8),
                       relief="flat", padx=8, cursor="hand2").pack(side="right", padx=5, pady=3)
-
         self.chat.window_create("end", window=card, padx=2, pady=2)
         self.chat.insert("end", "\n\n")
         self.chat.configure(state="disabled")
@@ -389,8 +423,6 @@ class ChatWindow:
             os.startfile(path)
         except Exception:
             messagebox.showerror("Hata", f"Dosya açılamadı:\n{path}", parent=self.win)
-
-    # -- gönder ---------------------------------------------------------------
 
     def _send_text(self):
         content = self.input_box.get("1.0", "end-1c").strip()
@@ -404,11 +436,8 @@ class ChatWindow:
             messagebox.showerror("Hata", f"{self.peer_name} adresine ulaşılamadı.", parent=self.win)
 
     def _pick_file(self):
-        path = filedialog.askopenfilename(
-            parent=self.win,
-            title="Dosya seç",
-            filetypes=[("Tüm dosyalar", "*.*")]
-        )
+        path = filedialog.askopenfilename(parent=self.win, title="Dosya seç",
+                                          filetypes=[("Tüm dosyalar", "*.*")])
         if not path:
             return
         if os.path.getsize(path) > MAX_FILE_BYTES:
@@ -429,8 +458,6 @@ class ChatWindow:
             self._append_file(self.username, filename, path, ts, is_me=True)
         else:
             messagebox.showerror("Hata", err or "Dosya gönderilemedi.", parent=self.win)
-
-    # -- alma -----------------------------------------------------------------
 
     def receive_text(self, content):
         ts = self.db.save_text(self.peer_ip, self.peer_name, "received", content)
@@ -469,28 +496,45 @@ class ChatWindow:
 # ---------------------------------------------------------------------------
 
 class TrayManager:
-    def __init__(self, toggle_fn, quit_fn):
+    def __init__(self, app):
+        self.app  = app
         self.icon = None
         if not HAS_EXTRAS:
             return
-        img  = self._make_icon()
-        menu = pystray.Menu(
-            pystray.MenuItem("Göster / Gizle", lambda i, it: toggle_fn(), default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Çıkış", lambda i, it: quit_fn()),
-        )
-        self.icon = pystray.Icon("lan_messenger", img, "LAN Messenger", menu)
-        threading.Thread(target=self.icon.run, daemon=True).start()
+        self._setup()
 
-    @staticmethod
-    def _make_icon():
-        img  = PILImage.new("RGBA", (64, 64), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle([3, 3, 61, 46], radius=10, fill="#003399")
-        draw.polygon([(14, 42), (5, 58), (27, 42)], fill="#003399")
+    def _make_icon(self, status=STATUS_ONLINE):
+        color = STATUS_COLOR.get(status, "#003399")
+        img   = PILImage.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw  = ImageDraw.Draw(img)
+        draw.rounded_rectangle([3, 3, 61, 46], radius=10, fill=color)
+        draw.polygon([(14, 42), (5, 58), (27, 42)], fill=color)
         for cx in (19, 32, 45):
             draw.ellipse([cx - 5, 18, cx + 5, 28], fill="white")
         return img
+
+    def _setup(self):
+        menu = pystray.Menu(
+            pystray.MenuItem(
+                "Durum",
+                pystray.Menu(
+                    pystray.MenuItem("🟢 Çevrimiçi", lambda i, it: self.app.root.after(0, lambda: self.app.set_status(STATUS_ONLINE))),
+                    pystray.MenuItem("🟡 Meşgul",    lambda i, it: self.app.root.after(0, lambda: self.app.set_status(STATUS_BUSY))),
+                    pystray.MenuItem("🟠 Uzakta",    lambda i, it: self.app.root.after(0, lambda: self.app.set_status(STATUS_AWAY))),
+                )
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Göster / Gizle", lambda i, it: self.app.root.after(0, self.app.toggle_window), default=True),
+        )
+        self.icon = pystray.Icon("lan_messenger", self._make_icon(), "LAN Messenger", menu)
+        threading.Thread(target=self.icon.run, daemon=True).start()
+
+    def update_icon(self, status):
+        if self.icon:
+            try:
+                self.icon.icon = self._make_icon(status)
+            except Exception:
+                pass
 
     def stop(self):
         if self.icon:
@@ -509,9 +553,11 @@ class LANMessengerApp:
         self.root = tk.Tk()
         self.root.withdraw()
 
-        self.peers          = {}   # {ip: name}
-        self.chat_windows   = {}   # {ip: ChatWindow}
+        self.peers          = {}              # {ip: name}
+        self.peer_statuses  = {}              # {ip: status}
+        self.chat_windows   = {}
         self.username       = None
+        self.own_status     = STATUS_ONLINE
         self.db             = None
         self.network        = None
         self.tray           = None
@@ -533,7 +579,7 @@ class LANMessengerApp:
         except Exception:
             return "127.0.0.1"
 
-    # -- giriş ----------------------------------------------------------------
+    # -- giriş ---------------------------------------------------------------
 
     def _show_login(self):
         win = tk.Toplevel(self.root)
@@ -542,7 +588,6 @@ class LANMessengerApp:
         win.configure(bg="#003399")
         win.resizable(False, False)
         win.protocol("WM_DELETE_WINDOW", self.root.destroy)
-
         win.update_idletasks()
         sx, sy = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry(f"320x215+{(sx-320)//2}+{(sy-215)//2}")
@@ -578,7 +623,7 @@ class LANMessengerApp:
         win.grab_set()
         win.wait_window()
 
-    # -- ana pencere ----------------------------------------------------------
+    # -- başlatma ------------------------------------------------------------
 
     def _start_main(self):
         self.local_ip = self._local_ip()
@@ -589,28 +634,39 @@ class LANMessengerApp:
             on_peer_found = self._on_peer_found,
             on_peer_lost  = self._on_peer_lost,
             on_message    = self._on_message,
+            get_status    = lambda: self.own_status,
         )
         self.network.start()
-        self.tray = TrayManager(
-            toggle_fn = self.toggle_window,
-            quit_fn   = self._on_quit,
-        )
+        self.tray = TrayManager(self)
+
+        # Windows başlangıcına ekle (bir kez)
+        if not is_in_startup():
+            add_to_startup()
+
         self._build_main()
         self.root.deiconify()
 
+    # -- ana pencere ---------------------------------------------------------
+
     def _build_main(self):
         self.root.title(f"LAN Messenger — {self.username}")
-        self.root.geometry("255x440")
+        self.root.geometry("255x460")
         self.root.configure(bg="#003399")
         self.root.resizable(False, True)
-        # Tray varsa kapat → gizle; yoksa → çıkış
-        self.root.protocol("WM_DELETE_WINDOW",
-                           self._hide_to_tray if HAS_EXTRAS else self._on_quit)
+        # X → kapanmaz, meşgule geçer
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_button)
 
+        # Profil başlığı
         header = tk.Frame(self.root, bg="#002277")
         header.pack(fill="x")
-        tk.Label(header, text="🟢", bg="#002277", font=("Arial", 14)
-                 ).pack(side="left", padx=(10, 3), pady=10)
+
+        self._status_btn = tk.Button(
+            header, text=STATUS_DOT[self.own_status],
+            bg="#002277", relief="flat", cursor="hand2",
+            font=("Arial", 15), bd=0,
+            command=self._show_status_menu
+        )
+        self._status_btn.pack(side="left", padx=(8, 2), pady=8)
         tk.Label(header, text=self.username, bg="#002277", fg="white",
                  font=("Tahoma", 12, "bold")).pack(side="left", pady=10)
         tk.Label(header, text=f"({self.local_ip})", bg="#002277", fg="#6677AA",
@@ -643,7 +699,40 @@ class LANMessengerApp:
         )
         self._status_lbl.pack(fill="x", side="bottom")
 
-    # -- tray -----------------------------------------------------------------
+    # -- X butonu davranışı --------------------------------------------------
+
+    def _on_close_button(self):
+        """X'e basınca kapanmaz — durumu Meşgul yapar ve gizlenir."""
+        self.set_status(STATUS_BUSY)
+        self.root.withdraw()
+        self._win_visible = False
+
+    # -- durum yönetimi ------------------------------------------------------
+
+    def set_status(self, status):
+        self.own_status = status
+        if hasattr(self, "_status_btn"):
+            self._status_btn.config(text=STATUS_DOT[status])
+        if self.tray:
+            self.tray.update_icon(status)
+        if self.network:
+            threading.Thread(target=self.network.broadcast_status, daemon=True).start()
+
+    def _show_status_menu(self):
+        menu = tk.Menu(self.root, tearoff=0, bg="#003399", fg="white",
+                       activebackground="#0055CC", activeforeground="white",
+                       font=("Tahoma", 10))
+        for st in (STATUS_ONLINE, STATUS_BUSY, STATUS_AWAY):
+            label = f"{STATUS_DOT[st]}  {STATUS_LABEL[st]}"
+            menu.add_command(label=label, command=lambda s=st: self.set_status(s))
+        try:
+            x = self._status_btn.winfo_rootx()
+            y = self._status_btn.winfo_rooty() + self._status_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    # -- tray ----------------------------------------------------------------
 
     def toggle_window(self):
         if self._win_visible:
@@ -653,14 +742,10 @@ class LANMessengerApp:
             self.root.lift()
         self._win_visible = not self._win_visible
 
-    def _hide_to_tray(self):
-        self.root.withdraw()
-        self._win_visible = False
+    # -- ağ olayları ---------------------------------------------------------
 
-    # -- ağ olayları ----------------------------------------------------------
-
-    def _on_peer_found(self, ip, name):
-        self.root.after(0, lambda: self._add_peer(ip, name))
+    def _on_peer_found(self, ip, name, status):
+        self.root.after(0, lambda: self._add_peer(ip, name, status))
 
     def _on_peer_lost(self, ip):
         self.root.after(0, lambda: self._remove_peer(ip))
@@ -675,20 +760,23 @@ class LANMessengerApp:
             raw      = msg.get("raw_data", b"")
             self.root.after(0, lambda: self._recv_file(sender_ip, sender_name, filename, raw))
 
-    # -- kişi listesi ---------------------------------------------------------
+    # -- kişi listesi --------------------------------------------------------
 
-    def _add_peer(self, ip, name):
-        self.peers[ip] = name
+    def _add_peer(self, ip, name, status):
+        self.peers[ip]         = name
+        self.peer_statuses[ip] = status
         self._refresh_list()
 
     def _remove_peer(self, ip):
         self.peers.pop(ip, None)
+        self.peer_statuses.pop(ip, None)
         self._refresh_list()
 
     def _refresh_list(self):
         self._listbox.delete(0, "end")
-        for name in self.peers.values():
-            self._listbox.insert("end", f"  🟢  {name}")
+        for ip, name in self.peers.items():
+            dot = STATUS_DOT.get(self.peer_statuses.get(ip, STATUS_ONLINE), "🟢")
+            self._listbox.insert("end", f"  {dot}  {name}")
         count = len(self.peers)
         self._count_lbl.config(text=f"({count} çevrimiçi)" if count else "(kimse yok)")
         self._status_lbl.config(
@@ -696,7 +784,7 @@ class LANMessengerApp:
             else f"Ağ taranıyor...  •  {self.local_ip}"
         )
 
-    # -- sohbet ---------------------------------------------------------------
+    # -- sohbet --------------------------------------------------------------
 
     def _open_from_list(self, _=None):
         sel = self._listbox.curselection()
@@ -713,13 +801,10 @@ class LANMessengerApp:
             self.chat_windows[ip].focus()
             return
         self.chat_windows[ip] = ChatWindow(
-            parent    = self.root,
-            username  = self.username,
-            peer_ip   = ip,
-            peer_name = name,
-            db        = self.db,
-            network   = self.network,
-            on_close  = self._close_chat,
+            parent=self.root, username=self.username,
+            peer_ip=ip, peer_name=name,
+            db=self.db, network=self.network,
+            on_close=self._close_chat,
         )
 
     def _close_chat(self, ip):
@@ -730,15 +815,17 @@ class LANMessengerApp:
             except Exception:
                 pass
 
-    # -- mesaj alma -----------------------------------------------------------
+    # -- mesaj alma ----------------------------------------------------------
 
     def _recv_text(self, ip, name, content):
+        # Meşgulse sessiz bildirim (zil yok), ama pencere açılır
         if ip in self.chat_windows and self.chat_windows[ip].exists():
             self.chat_windows[ip].receive_text(content)
         else:
             self._open_chat(ip, name)
             self.root.after(200, lambda: self._deliver_text(ip, content))
-        if HAS_EXTRAS:
+        # Pencereyi göster
+        if not self._win_visible:
             self.root.deiconify()
             self._win_visible = True
 
@@ -748,7 +835,7 @@ class LANMessengerApp:
         else:
             self._open_chat(ip, name)
             self.root.after(200, lambda: self._deliver_file(ip, filename, raw))
-        if HAS_EXTRAS:
+        if not self._win_visible:
             self.root.deiconify()
             self._win_visible = True
 
@@ -760,7 +847,7 @@ class LANMessengerApp:
         if ip in self.chat_windows and self.chat_windows[ip].exists():
             self.chat_windows[ip].receive_file(filename, raw)
 
-    # -- çıkış ----------------------------------------------------------------
+    # -- çıkış ---------------------------------------------------------------
 
     def _on_quit(self):
         if self.network:
